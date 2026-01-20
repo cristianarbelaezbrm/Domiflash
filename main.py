@@ -33,11 +33,13 @@ def load_secret_as_env(secret_name: str, env_var: str, project_id: str = "coil-3
 
 @tool
 def healthcheck() -> str:
+    """Devuelve un estado simple del servicio."""
     return "ok"
 
 
 @tool
 def summarize_text(text: str, max_bullets: int = 5) -> str:
+    """Resume un texto en viñetas (máx max_bullets)."""
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()][:max_bullets]
     if not lines:
         return "No hay contenido para resumir."
