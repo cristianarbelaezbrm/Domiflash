@@ -1,4 +1,6 @@
 import os
+import json
+import time
 import logging
 from typing import Optional, Dict, Any
 
@@ -14,6 +16,14 @@ from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
+
+# -----------------------------
+# DOMICILIARIOS (MANUAL POR AHORA)
+# -----------------------------
+# Aquí pegas los chat_id que te den por /id en Telegram
+DRIVERS = [
+    {"driver_id": "d1", "name": "Camila G", "chat_id": 987654321, "is_available": True},
+]
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tg-langgraph-agent")
@@ -46,8 +56,82 @@ def summarize_text(text: str, max_bullets: int = 5) -> str:
     bullets = "\n".join([f"- {ln[:200]}" for ln in lines])
     return f"Resumen ({len(lines)} puntos):\n{bullets}"
 
+@tool
+def assign_driver(order_json: str) -> str:
+    """
+    Asigna automáticamente un domiciliario disponible a un pedido.
+    Recibe order_json y retorna JSON con driver asignado o error.
+    """
+    try:
+        order = json.loads(order_json)
+    except Exception:
+        return json.dumps({"ok": False, "error": "order_json inválido (no es JSON)."})
 
-TOOLS = [healthcheck, summarize_text]
+    available = [d for d in DRIVERS if d.get("is_available")]
+
+    if not available:
+        return json.dumps({"ok": False, "error": "No hay domiciliarios disponibles."})
+
+    # Regla simple: toma el primero disponible
+    driver = available[0]
+    driver["is_available"] = False  # lo reservamos temporalmente
+
+    dispatch_id = f"disp_{int(time.time())}"
+
+    return json.dumps({
+        "ok": True,
+        "dispatch_id": dispatch_id,
+        "driver_id": driver["driver_id"],
+        "driver_name": driver["name"],
+        "driver_chat_id": driver["chat_id"],
+    })
+
+def _format_order_message(order: dict) -> str:
+    return (
+        "📦 *Nuevo pedido*\n"
+        f"👤 Cliente: {order.get('cliente','')}\n"
+        f"📍 Dirección: {order.get('direccion','')}\n"
+        f"📞 Teléfono: {order.get('telefono','')}\n"
+        f"💳 Pago: {order.get('medio_pago','')}\n"
+        f"📝 Obs: {order.get('observaciones','')}\n\n"
+        "Responde: *ACEPTO* o *NO PUEDO*"
+    )
+
+@tool
+def send_order_to_driver(driver_chat_id: int, order_json: str) -> str:
+    """
+    Envía el pedido (order_json) por Telegram al chat_id del domiciliario.
+    Retorna JSON ok/error.
+    """
+    try:
+        order = json.loads(order_json)
+    except Exception:
+        return json.dumps({"ok": False, "error": "order_json inválido (no es JSON)."})
+
+    msg = _format_order_message(order)
+
+    import asyncio
+
+    async def _send():
+        await tg_app.bot.send_message(
+            chat_id=driver_chat_id,
+            text=msg,
+            parse_mode="Markdown"
+        )
+
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.create_task(_send())
+        else:
+            loop.run_until_complete(_send())
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"Fallo enviando a driver: {str(e)}"})
+
+    return json.dumps({"ok": True})
+
+
+TOOLS = [healthcheck, summarize_text, assign_driver, send_order_to_driver]
 
 
 def build_agent():
@@ -57,49 +141,38 @@ def build_agent():
     )
 
     system_prompt = """
-        Eres “Domiflash”, un agente virtual de atención para una empresa de domicilios, el cliente te va a mencionar un restaurante y un producto, no lo tienes que conocer.
+          Eres “Domiflash”, agente virtual de atención para una empresa de domicilios, el cliente te va a mencionar un restaurante y un producto, no lo tienes que conocer.
 
-        🎯 TU OBJETIVO PRINCIPAL:
-        Recibir, estructurar y validar pedidos de domicilio de forma clara, amable y eficiente.
+        OBJETIVO:
+        Tomar pedidos y coordinarlos con un domiciliario. Debes capturar y validar:
 
-        📌 INFORMACIÓN QUE DEBES CAPTURAR (OBLIGATORIA):
-        En cada conversación debes obtener y confirmar estos 4 datos antes de finalizar el pedido:
+        1) cliente (nombre)
+        2) direccion exacta
+        3) telefono
+        4) medio_pago
 
-        1) Nombre del cliente  
-        2) Dirección exacta de entrega  
-        3) Teléfono de contacto  
-        4) Medio de pago (efectivo o transferencia)
+        REGLAS:
+        - Habla en español, tono amable y operativo.
+        - Haz UNA sola pregunta a la vez si falta info.
+        - No inventes datos.
+        - Antes de despachar, muestra un resumen y pide confirmación: “¿Confirmas el pedido?”
 
-        📋 FORMATO DE SALIDA (cuando el pedido esté completo):
-        Devuelve SIEMPRE el pedido en este formato estructurado (JSON):
-
+        FORMATO DEL PEDIDO (cuando tengas todo):
         {
-        "cliente": "",
-        "direccion": "",
-        "telefono": "",
-        "medio_pago": "",
-        "observaciones": ""
+        "cliente": "...",
+        "direccion": "...",
+        "telefono": "...",
+        "medio_pago": "...",
+        "observaciones": "..."
         }
 
-        🗣️ REGLAS DE CONVERSACIÓN:
-        - Habla en español, tono amable, profesional y breve.
-        - Si falta información, haz UNA sola pregunta a la vez.
-        - Nunca asumas datos que el usuario no haya dado explícitamente.
-        - Si la dirección es ambigua, pide puntos de referencia.
-        - Si el usuario cambia de opinión, actualiza los datos y confirma de nuevo.
-        - No finalices el pedido hasta tener los 4 datos completos y confirmados.
+        DESPACHO AUTOMÁTICO (OBLIGATORIO):
+        Después de que el usuario confirme explícitamente, debes:
+        1) Llamar assign_driver(order_json).
+        2) Si ok=True, llamar send_order_to_driver(driver_chat_id, order_json).
+        3) Responder al cliente confirmando: domiciliario asignado + dispatch_id.
 
-        🛑 MANEJO DE ERRORES:
-        - Si el usuario da un número de teléfono inválido para colombia, pide que lo repita.
-        - Si la dirección no es clara, solicita detalles adicionales.
-        - Si el medio de pago no es soportado, ofrece las opciones válidas.
-
-        📦 CONFIRMACIÓN FINAL:
-        Antes de cerrar, pregunta:
-        “¿Confirmas el pedido con estos datos?”
-
-        Solo después de la confirmación explícita del usuario, marca el pedido como “listo para despacho”.
-
+        Si no hay domiciliarios disponibles, informa al cliente y pregunta si desea esperar o cancelar.
         """
 
     checkpointer = MemorySaver()
@@ -135,6 +208,7 @@ async def on_startup():
     # 3) Inicia Telegram webhook
     tg_app = Application.builder().token(token).build()
     tg_app.add_handler(CommandHandler("start", start_cmd))
+    tg_app.add_handler(CommandHandler("id", id_cmd))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     await tg_app.initialize()
@@ -171,6 +245,9 @@ async def run_agent(user_text: str, chat_id: int) -> str:
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Listo ✅ Escríbeme y te respondo.")
 
+async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(f"Tu chat_id es: {chat_id}")
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
