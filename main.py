@@ -56,26 +56,52 @@ def summarize_text(text: str, max_bullets: int = 5) -> str:
     bullets = "\n".join([f"- {ln[:200]}" for ln in lines])
     return f"Resumen ({len(lines)} puntos):\n{bullets}"
 
+# @tool
+# def assign_driver(order_json: str) -> str:
+#     """
+#     Asigna automáticamente un domiciliario disponible a un pedido.
+#     Recibe order_json y retorna JSON con driver asignado o error.
+#     """
+#     try:
+#         order = json.loads(order_json)
+#     except Exception:
+#         return json.dumps({"ok": False, "error": "order_json inválido (no es JSON)."})
+
+#     available = [d for d in DRIVERS if d.get("is_available")]
+
+#     if not available:
+#         return json.dumps({"ok": False, "error": "No hay domiciliarios disponibles."})
+
+#     # Regla simple: toma el primero disponible
+#     driver = available[0]
+#     driver["is_available"] = False  # lo reservamos temporalmente
+
+#     dispatch_id = f"disp_{int(time.time())}"
+
+#     return json.dumps({
+#         "ok": True,
+#         "dispatch_id": dispatch_id,
+#         "driver_id": driver["driver_id"],
+#         "driver_name": driver["name"],
+#         "driver_chat_id": driver["chat_id"],
+#     })
+
 @tool
-def assign_driver(order_json: str) -> str:
+def assign_driver(cliente: str, direccion: str, telefono: str, medio_pago: str, observaciones: str = "") -> str:
     """
     Asigna automáticamente un domiciliario disponible a un pedido.
-    Recibe order_json y retorna JSON con driver asignado o error.
+    Recibe campos del pedido y retorna JSON con driver asignado o error.
     """
-    try:
-        order = json.loads(order_json)
-    except Exception:
-        return json.dumps({"ok": False, "error": "order_json inválido (no es JSON)."})
+    # Validación mínima
+    if not cliente or not direccion or not telefono or not medio_pago:
+        return json.dumps({"ok": False, "error": "Faltan campos obligatorios del pedido."})
 
     available = [d for d in DRIVERS if d.get("is_available")]
-
     if not available:
         return json.dumps({"ok": False, "error": "No hay domiciliarios disponibles."})
 
-    # Regla simple: toma el primero disponible
     driver = available[0]
-    driver["is_available"] = False  # lo reservamos temporalmente
-
+    driver["is_available"] = False
     dispatch_id = f"disp_{int(time.time())}"
 
     return json.dumps({
@@ -84,7 +110,15 @@ def assign_driver(order_json: str) -> str:
         "driver_id": driver["driver_id"],
         "driver_name": driver["name"],
         "driver_chat_id": driver["chat_id"],
+        "order": {
+            "cliente": cliente,
+            "direccion": direccion,
+            "telefono": telefono,
+            "medio_pago": medio_pago,
+            "observaciones": observaciones,
+        }
     })
+
 
 def _format_order_message(order: dict) -> str:
     return (
