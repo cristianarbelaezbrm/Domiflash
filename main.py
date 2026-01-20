@@ -87,37 +87,47 @@ def summarize_text(text: str, max_bullets: int = 5) -> str:
 #     })
 
 @tool
-def assign_driver(cliente: str, direccion: str, telefono: str, medio_pago: str, observaciones: str = "") -> str:
+def assign_driver(order_json) -> str:
     """
-    Asigna automáticamente un domiciliario disponible a un pedido.
-    Recibe campos del pedido y retorna JSON con driver asignado o error.
+    Asigna un domiciliario disponible.
+    Acepta order_json como: dict, JSON string, o texto. Retorna JSON ok/error.
     """
-    # Validación mínima
-    if not cliente or not direccion or not telefono or not medio_pago:
-        return json.dumps({"ok": False, "error": "Faltan campos obligatorios del pedido."})
+    try:
+        # Normaliza entrada
+        if isinstance(order_json, dict):
+            order = order_json
+        elif isinstance(order_json, str):
+            s = order_json.strip()
+            # intenta parsear como JSON si parece JSON
+            if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
+                order = json.loads(s)
+            else:
+                # no es JSON, pero no necesitamos el contenido para asignar
+                order = {"raw": s}
+        else:
+            order = {"raw_type": str(type(order_json))}
+    except Exception as e:
+        return json.dumps({"ok": False, "error": "No se pudo interpretar order_json", "detail": str(e)})
 
-    available = [d for d in DRIVERS if d.get("is_available")]
-    if not available:
-        return json.dumps({"ok": False, "error": "No hay domiciliarios disponibles."})
+    try:
+        available = [d for d in DRIVERS if d.get("is_available") is True]
+        if not available:
+            return json.dumps({"ok": False, "error": "No hay domiciliarios disponibles."})
 
-    driver = available[0]
-    driver["is_available"] = False
-    dispatch_id = f"disp_{int(time.time())}"
+        driver = available[0]
+        driver["is_available"] = False
+        dispatch_id = f"disp_{int(time.time())}"
 
-    return json.dumps({
-        "ok": True,
-        "dispatch_id": dispatch_id,
-        "driver_id": driver["driver_id"],
-        "driver_name": driver["name"],
-        "driver_chat_id": driver["chat_id"],
-        "order": {
-            "cliente": cliente,
-            "direccion": direccion,
-            "telefono": telefono,
-            "medio_pago": medio_pago,
-            "observaciones": observaciones,
-        }
-    })
+        return json.dumps({
+            "ok": True,
+            "dispatch_id": dispatch_id,
+            "driver_id": driver.get("driver_id"),
+            "driver_name": driver.get("name"),
+            "driver_chat_id": driver.get("chat_id"),
+        })
+    except Exception as e:
+        return json.dumps({"ok": False, "error": "Error asignando domiciliario", "detail": str(e)})
+
 
 
 def _format_order_message(order: dict) -> str:
