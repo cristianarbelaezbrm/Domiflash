@@ -141,38 +141,69 @@ def _format_order_message(order: dict) -> str:
         "Responde: *ACEPTO* o *NO PUEDO*"
     )
 
+# @tool
+# def send_order_to_driver(driver_chat_id: int, order_json: str) -> str:
+#     """
+#     Envía el pedido (order_json) por Telegram al chat_id del domiciliario.
+#     Retorna JSON ok/error.
+#     """
+#     try:
+#         order = json.loads(order_json)
+#     except Exception:
+#         return json.dumps({"ok": False, "error": "order_json inválido (no es JSON)."})
+
+#     msg = _format_order_message(order)
+
+#     import asyncio
+
+#     async def _send():
+#         await tg_app.bot.send_message(
+#             chat_id=driver_chat_id,
+#             text=msg,
+#             parse_mode="Markdown"
+#         )
+
+#     try:
+#         loop = asyncio.get_event_loop()
+#         if loop.is_running():
+#             asyncio.create_task(_send())
+#         else:
+#             loop.run_until_complete(_send())
+#     except Exception as e:
+#         return json.dumps({"ok": False, "error": f"Fallo enviando a driver: {str(e)}"})
+
+#     return json.dumps({"ok": True})
+
 @tool
 def send_order_to_driver(driver_chat_id: int, order_json: str) -> str:
-    """
-    Envía el pedido (order_json) por Telegram al chat_id del domiciliario.
-    Retorna JSON ok/error.
-    """
+    """Envía el pedido por Telegram al chat_id del domiciliario."""
     try:
-        order = json.loads(order_json)
+        order = json.loads(order_json) if isinstance(order_json, str) else order_json
     except Exception:
-        return json.dumps({"ok": False, "error": "order_json inválido (no es JSON)."})
+        order = {"raw": str(order_json)}
 
     msg = _format_order_message(order)
 
     import asyncio
 
     async def _send():
-        await tg_app.bot.send_message(
-            chat_id=driver_chat_id,
-            text=msg,
-            parse_mode="Markdown"
-        )
+        await tg_app.bot.send_message(chat_id=driver_chat_id, text=msg, parse_mode="Markdown")
 
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            asyncio.create_task(_send())
-        else:
-            loop.run_until_complete(_send())
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(_send())
+            else:
+                loop.run_until_complete(_send())
+        except RuntimeError:
+            # típico en ThreadPoolExecutor: no hay event loop
+            asyncio.run(_send())
     except Exception as e:
         return json.dumps({"ok": False, "error": f"Fallo enviando a driver: {str(e)}"})
 
     return json.dumps({"ok": True})
+
 
 
 TOOLS = [healthcheck, summarize_text, assign_driver, send_order_to_driver]
