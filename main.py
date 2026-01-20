@@ -22,7 +22,7 @@ from langgraph.checkpoint.memory import MemorySaver
 # -----------------------------
 # Aquí pegas los chat_id que te den por /id en Telegram
 DRIVERS = [
-    {"driver_id": "d1", "name": "Camila G", "chat_id": 987654321, "is_available": True},
+    {"driver_id": "d1", "name": "Camila G", "chat_id": 7153322754, "is_available": True},
 ]
 
 logging.basicConfig(level=logging.INFO)
