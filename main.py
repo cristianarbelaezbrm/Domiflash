@@ -122,10 +122,10 @@ def build_agent():
     checkpointer = MemorySaver()
 
     agent = create_react_agent(
-        model=llm,
-        tools=TOOLS,
-        prompt=system_prompt,
-        checkpointer=checkpointer,
+    model=llm,
+    tools=TOOLS,
+    state_modifier=system_prompt,
+    checkpointer=checkpointer,
     )
     return agent
 
