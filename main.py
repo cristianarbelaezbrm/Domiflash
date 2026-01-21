@@ -26,10 +26,10 @@ DRIVERS = [
     {"driver_id": "d1", "name": "Camila V", "chat_id": 1076570639, "is_available": True},
 ]
 
-# dispatch_id -> info del despacho (RAM, se pierde si Cloud Run reinicia)
+# dispatch_id -> info del despacho
 ACTIVE_DISPATCHES: Dict[str, Dict[str, Any]] = {}
 
-# driver_chat_id -> dispatch_id activo (para saber qué está aceptando)
+# driver_chat_id -> dispatch_id activo
 DRIVER_ACTIVE: Dict[int, str] = {}
 
 
@@ -159,17 +159,17 @@ def _format_order_message(order: dict) -> str:
 
 @tool
 def send_order_to_driver(driver_chat_id: int, customer_chat_id: int, dispatch_id: str, order_json: str) -> str:
-    """Envía el pedido por Telegram al chat_id del domiciliario y registra el despacho activo."""
+    """Envía el pedido por Telegram al domiciliario y registra el despacho activo."""
     try:
         order = json.loads(order_json) if isinstance(order_json, str) else order_json
     except Exception:
         order = {"raw": str(order_json)}
 
-    # Registrar contexto del despacho (RAM)
+    # Guarda el despacho con el customer_chat_id REAL (no adivinado)
     ACTIVE_DISPATCHES[dispatch_id] = {
         "dispatch_id": dispatch_id,
-        "driver_chat_id": driver_chat_id,
-        "customer_chat_id": customer_chat_id,
+        "driver_chat_id": int(driver_chat_id),
+        "customer_chat_id": int(customer_chat_id),
         "order": order,
         "status": "sent",
         "ts": int(time.time()),
@@ -181,7 +181,11 @@ def send_order_to_driver(driver_chat_id: int, customer_chat_id: int, dispatch_id
     import asyncio
 
     async def _send():
-        await tg_app.bot.send_message(chat_id=driver_chat_id, text=msg, parse_mode="Markdown")
+        await tg_app.bot.send_message(
+            chat_id=int(driver_chat_id),
+            text=msg,
+            parse_mode="Markdown"
+        )
 
     try:
         try:
@@ -224,6 +228,8 @@ def build_agent():
         - Haz UNA sola pregunta a la vez si falta info.
         - No inventes datos.
         - Antes de despachar, muestra un resumen y pide confirmación: “¿Confirmas el pedido?”
+        - Customer_chat_id es el valor exacto mostrado en el system message dinámico: customer_chat_id=...
+
 
         FORMATO DEL PEDIDO (cuando tengas todo):
         {
@@ -241,18 +247,11 @@ def build_agent():
         - El resultado será un JSON con: ok, dispatch_id, driver_chat_id, driver_name, etc.
 
         Paso 2) Si ok=true, llama a:
-        send_order_to_driver(
-        driver_chat_id=<el driver_chat_id devuelto en el Paso 1>,
-        customer_chat_id=<thread_id de esta conversación>,
-        dispatch_id=<el dispatch_id devuelto en el Paso 1>,
-        order_json=<el mismo JSON del pedido>
-        )
+        send_order_to_driver(driver_chat_id, customer_chat_id, dispatch_id, order_json)
 
         IMPORTANTE:
-        - customer_chat_id SIEMPRE es el thread_id de esta conversación (el chat del cliente actual).
-        - No inventes driver_chat_id ni dispatch_id: debes usar los valores que devolvió assign_driver.
-        - No llames send_order_to_driver si assign_driver devolvió ok=false.
-
+        - customer_chat_id es el valor EXACTO del system message dinámico: customer_chat_id=...
+        - No inventes driver_chat_id ni dispatch_id: usa los valores devueltos por assign_driver.
         """
 
     checkpointer = MemorySaver()
@@ -312,7 +311,15 @@ async def run_agent(user_text: str, chat_id: int) -> str:
         return "El agente no está inicializado (revisa logs / secretos)."
 
     config = {"configurable": {"thread_id": str(chat_id)}}
-    inputs: Dict[str, Any] = {"messages": [("user", user_text)]}
+
+    # 👇 Mensaje del sistema dinámico con el chat_id real del cliente
+    inputs: Dict[str, Any] = {
+        "messages": [
+            ("system", f"customer_chat_id={chat_id} (usa este valor cuando llames herramientas)."),
+            ("user", user_text),
+        ]
+    }
+
     result = await AGENT.ainvoke(inputs, config=config)
 
     messages = result.get("messages", [])
@@ -322,6 +329,7 @@ async def run_agent(user_text: str, chat_id: int) -> str:
     return "No pude generar una respuesta. Intenta de nuevo."
 
 
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Listo ✅ Escríbeme y te respondo.")
 
@@ -329,9 +337,63 @@ async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await update.message.reply_text(f"Tu chat_id es: {chat_id}")
 
+# async def handle_driver_message(update: Update, context: ContextTypes.DEFAULT_TYPE, driver_chat_id: int, text: str):
+#     driver = get_driver_by_chat(driver_chat_id)
+#     t = text.strip().lower()
+
+#     dispatch_id = DRIVER_ACTIVE.get(driver_chat_id)
+#     if not dispatch_id or dispatch_id not in ACTIVE_DISPATCHES:
+#         await update.message.reply_text(
+#             "No tengo un pedido activo asignado. Si te llega uno, responde ACEPTO o NO PUEDO."
+#         )
+#         return
+
+#     dispatch = ACTIVE_DISPATCHES[dispatch_id]
+#     customer_chat_id = dispatch["customer_chat_id"]
+
+#     if t in ["acepto", "aceptar", "ok", "listo", "si"]:
+#         dispatch["status"] = "accepted"
+
+#         # Notificar al cliente
+#         await context.bot.send_message(
+#             chat_id=customer_chat_id,
+#             text=f"✅ Tu pedido fue aceptado por {driver.get('name','el domiciliario')} y ya va en camino. (ID: {dispatch_id})"
+#         )
+
+#         await update.message.reply_text("✅ Perfecto. Quedaste asignado a este pedido.")
+
+#         return
+
+#     if t in ["no puedo", "nopuedo", "rechazo", "cancelar", "no"]:
+#         dispatch["status"] = "rejected"
+
+#         # Liberar domiciliario
+#         if driver:
+#             driver["is_available"] = True
+
+#         await context.bot.send_message(
+#             chat_id=customer_chat_id,
+#             text=f"⚠️ El domiciliario no pudo tomar tu pedido (ID: {dispatch_id}). Estoy buscando otro disponible."
+#         )
+
+#         await update.message.reply_text("Entendido. Liberé el pedido.")
+
+#         # aquí podrías reintentar asignación automática con otro driver
+#         return
+
+#     await update.message.reply_text("Responde únicamente con: ACEPTO o NO PUEDO.")
+
+
 # async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #     chat_id = update.effective_chat.id
-#     text = update.message.text.strip()
+#     text = (update.message.text or "").strip()
+
+#     # 1) Si es domiciliario: manejar aceptación / rechazo
+#     if is_driver_chat(chat_id):
+#         await handle_driver_message(update, context, chat_id, text)
+#         return
+
+#     # 2) Si es cliente: flujo normal con el agente
 #     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 #     answer = await run_agent(text, chat_id)
 #     await update.message.reply_text(answer)
@@ -340,44 +402,40 @@ async def handle_driver_message(update: Update, context: ContextTypes.DEFAULT_TY
     driver = get_driver_by_chat(driver_chat_id)
     t = text.strip().lower()
 
-    dispatch_id = DRIVER_ACTIVE.get(driver_chat_id)
+    dispatch_id = DRIVER_ACTIVE.get(int(driver_chat_id))
     if not dispatch_id or dispatch_id not in ACTIVE_DISPATCHES:
-        await update.message.reply_text(
-            "No tengo un pedido activo asignado. Si te llega uno, responde ACEPTO o NO PUEDO."
-        )
+        await update.message.reply_text("No tengo un pedido activo. Si te llega uno, responde ACEPTO o NO PUEDO.")
         return
 
     dispatch = ACTIVE_DISPATCHES[dispatch_id]
-    customer_chat_id = dispatch["customer_chat_id"]
+    customer_chat_id = dispatch.get("customer_chat_id")
 
-    if t in ["acepto", "aceptar", "ok", "listo", "si"]:
+    if t in ["acepto", "aceptar", "ok", "listo", "si", "sí"]:
         dispatch["status"] = "accepted"
+        try:
+            await context.bot.send_message(
+                chat_id=int(customer_chat_id),
+                text=f"✅ Tu pedido fue aceptado por {driver.get('name','el domiciliario')} y va en camino. (ID: {dispatch_id})"
+            )
+        except Exception as e:
+            logger.exception("No pude notificar al cliente chat_id=%r", customer_chat_id)
+            await update.message.reply_text("✅ Aceptado, pero no pude notificar al cliente (chat_id inválido).")
+            return
 
-        # Notificar al cliente
-        await context.bot.send_message(
-            chat_id=customer_chat_id,
-            text=f"✅ Tu pedido fue aceptado por {driver.get('name','el domiciliario')} y ya va en camino. (ID: {dispatch_id})"
-        )
-
-        await update.message.reply_text("✅ Perfecto. Quedaste asignado a este pedido.")
-
+        await update.message.reply_text("✅ Pedido aceptado. Gracias.")
         return
 
-    if t in ["no puedo", "nopuedo", "rechazo", "cancelar", "no"]:
+    if t in ["no puedo", "rechazo", "no", "cancelar"]:
         dispatch["status"] = "rejected"
-
-        # Liberar domiciliario
         if driver:
             driver["is_available"] = True
 
         await context.bot.send_message(
-            chat_id=customer_chat_id,
+            chat_id=int(customer_chat_id),
             text=f"⚠️ El domiciliario no pudo tomar tu pedido (ID: {dispatch_id}). Estoy buscando otro disponible."
         )
 
-        await update.message.reply_text("Entendido. Liberé el pedido.")
-
-        # aquí podrías reintentar asignación automática con otro driver
+        await update.message.reply_text("Entendido. Pedido liberado.")
         return
 
     await update.message.reply_text("Responde únicamente con: ACEPTO o NO PUEDO.")
@@ -387,15 +445,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = (update.message.text or "").strip()
 
-    # 1) Si es domiciliario: manejar aceptación / rechazo
     if is_driver_chat(chat_id):
         await handle_driver_message(update, context, chat_id, text)
         return
 
-    # 2) Si es cliente: flujo normal con el agente
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     answer = await run_agent(text, chat_id)
     await update.message.reply_text(answer)
+
 
 
 @app.post("/telegram")
