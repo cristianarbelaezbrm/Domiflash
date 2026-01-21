@@ -128,19 +128,34 @@ def _format_order_message(order: dict) -> str:
     )
 
 # @tool
-# def send_order_to_driver(driver_chat_id: int, order_json: str) -> str:
-#     """Envía el pedido por Telegram al chat_id del domiciliario."""
+# def send_order_to_driver(driver_chat_id: int, customer_chat_id: int, dispatch_id: str, order_json: str) -> str:
+#     """Envía el pedido por Telegram al domiciliario y registra el despacho activo."""
 #     try:
 #         order = json.loads(order_json) if isinstance(order_json, str) else order_json
 #     except Exception:
 #         order = {"raw": str(order_json)}
+
+#     # Guarda el despacho con el customer_chat_id REAL (no adivinado)
+#     ACTIVE_DISPATCHES[dispatch_id] = {
+#         "dispatch_id": dispatch_id,
+#         "driver_chat_id": int(driver_chat_id),
+#         "customer_chat_id": int(customer_chat_id),
+#         "order": order,
+#         "status": "sent",
+#         "ts": int(time.time()),
+#     }
+#     DRIVER_ACTIVE[int(driver_chat_id)] = dispatch_id
 
 #     msg = _format_order_message(order)
 
 #     import asyncio
 
 #     async def _send():
-#         await tg_app.bot.send_message(chat_id=driver_chat_id, text=msg, parse_mode="Markdown")
+#         await tg_app.bot.send_message(
+#             chat_id=int(driver_chat_id),
+#             text=msg,
+#             parse_mode="Markdown"
+#         )
 
 #     try:
 #         try:
@@ -150,22 +165,24 @@ def _format_order_message(order: dict) -> str:
 #             else:
 #                 loop.run_until_complete(_send())
 #         except RuntimeError:
-#             # típico en ThreadPoolExecutor: no hay event loop
 #             asyncio.run(_send())
 #     except Exception as e:
+#         ACTIVE_DISPATCHES[dispatch_id]["status"] = "send_failed"
 #         return json.dumps({"ok": False, "error": f"Fallo enviando a driver: {str(e)}"})
 
 #     return json.dumps({"ok": True})
 
 @tool
 def send_order_to_driver(driver_chat_id: int, customer_chat_id: int, dispatch_id: str, order_json: str) -> str:
-    """Envía el pedido por Telegram al domiciliario y registra el despacho activo."""
+    """
+    Registra el despacho y devuelve el mensaje que debe enviarse al domiciliario.
+    (El envío real se hace en el handler async para evitar errores de transporte en Cloud Run.)
+    """
     try:
         order = json.loads(order_json) if isinstance(order_json, str) else order_json
     except Exception:
         order = {"raw": str(order_json)}
 
-    # Guarda el despacho con el customer_chat_id REAL (no adivinado)
     ACTIVE_DISPATCHES[dispatch_id] = {
         "dispatch_id": dispatch_id,
         "driver_chat_id": int(driver_chat_id),
@@ -178,29 +195,11 @@ def send_order_to_driver(driver_chat_id: int, customer_chat_id: int, dispatch_id
 
     msg = _format_order_message(order)
 
-    import asyncio
-
-    async def _send():
-        await tg_app.bot.send_message(
-            chat_id=int(driver_chat_id),
-            text=msg,
-            parse_mode="Markdown"
-        )
-
-    try:
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.create_task(_send())
-            else:
-                loop.run_until_complete(_send())
-        except RuntimeError:
-            asyncio.run(_send())
-    except Exception as e:
-        ACTIVE_DISPATCHES[dispatch_id]["status"] = "send_failed"
-        return json.dumps({"ok": False, "error": f"Fallo enviando a driver: {str(e)}"})
-
-    return json.dumps({"ok": True})
+    return json.dumps({
+        "ok": True,
+        "driver_chat_id": int(driver_chat_id),
+        "message": msg
+    })
 
 
 TOOLS = [healthcheck, summarize_text, assign_driver, send_order_to_driver]
@@ -306,28 +305,92 @@ async def on_shutdown():
         tg_app = None
 
 
+# async def run_agent(user_text: str, chat_id: int) -> str:
+#     if AGENT is None:
+#         return "El agente no está inicializado (revisa logs / secretos)."
+
+#     config = {"configurable": {"thread_id": str(chat_id)}}
+
+#     # 👇 Mensaje del sistema dinámico con el chat_id real del cliente
+#     inputs: Dict[str, Any] = {
+#         "messages": [
+#             ("system", f"customer_chat_id={chat_id} (usa este valor cuando llames herramientas)."),
+#             ("user", user_text),
+#         ]
+#     }
+
+#     result = await AGENT.ainvoke(inputs, config=config)
+
+#     messages = result.get("messages", [])
+#     for m in reversed(messages):
+#         if getattr(m, "type", None) == "ai":
+#             return (m.content or "").strip()
+#     return "No pude generar una respuesta. Intenta de nuevo."
+
 async def run_agent(user_text: str, chat_id: int) -> str:
+    """
+    Ejecuta el agente LangGraph y, si en la traza aparece una ToolMessage con payload
+    {"ok": true, "driver_chat_id": ..., "message": "..."} entonces envía ese mensaje
+    al domiciliario desde este contexto async (estable en Cloud Run).
+    """
     if AGENT is None:
         return "El agente no está inicializado (revisa logs / secretos)."
 
+    # thread_id = chat_id (memoria por conversación)
     config = {"configurable": {"thread_id": str(chat_id)}}
 
-    # 👇 Mensaje del sistema dinámico con el chat_id real del cliente
+    # Pista explícita para el modelo (para que pase customer_chat_id correcto a la tool)
     inputs: Dict[str, Any] = {
         "messages": [
-            ("system", f"customer_chat_id={chat_id} (usa este valor cuando llames herramientas)."),
+            ("system", f"customer_chat_id={chat_id} (usa este valor exacto cuando llames herramientas)."),
             ("user", user_text),
         ]
     }
 
-    result = await AGENT.ainvoke(inputs, config=config)
+    try:
+        result = await AGENT.ainvoke(inputs, config=config)
+    except Exception:
+        logger.exception("AGENT.ainvoke falló chat_id=%s", chat_id)
+        return "Se presentó un error procesando el pedido."
 
-    messages = result.get("messages", [])
-    for m in reversed(messages):
-        if getattr(m, "type", None) == "ai":
-            return (m.content or "").strip()
+    # 1) Si alguna tool devolvió un payload con message para el domiciliario, lo enviamos aquí (async)
+    try:
+        for m in result.get("messages", []):
+            if getattr(m, "type", None) == "tool":
+                content = getattr(m, "content", None)
+                if not isinstance(content, str) or not content:
+                    continue
+
+                # Intentar parsear JSON del tool output
+                try:
+                    payload = json.loads(content)
+                except Exception:
+                    continue
+
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("ok") is True
+                    and payload.get("driver_chat_id") is not None
+                    and payload.get("message")
+                ):
+                    await tg_app.bot.send_message(
+                        chat_id=int(payload["driver_chat_id"]),
+                        text=str(payload["message"]),
+                        parse_mode="Markdown",
+                    )
+    except Exception:
+        logger.exception("Fallo enviando mensaje al domiciliario desde run_agent chat_id=%s", chat_id)
+
+    # 2) Retornar la respuesta final del agente al usuario
+    try:
+        messages = result.get("messages", [])
+        for m in reversed(messages):
+            if getattr(m, "type", None) == "ai":
+                return (m.content or "").strip()
+    except Exception:
+        logger.exception("Fallo extrayendo respuesta AI chat_id=%s", chat_id)
+
     return "No pude generar una respuesta. Intenta de nuevo."
-
 
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -384,20 +447,6 @@ async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #     await update.message.reply_text("Responde únicamente con: ACEPTO o NO PUEDO.")
 
 
-# async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-#     chat_id = update.effective_chat.id
-#     text = (update.message.text or "").strip()
-
-#     # 1) Si es domiciliario: manejar aceptación / rechazo
-#     if is_driver_chat(chat_id):
-#         await handle_driver_message(update, context, chat_id, text)
-#         return
-
-#     # 2) Si es cliente: flujo normal con el agente
-#     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-#     answer = await run_agent(text, chat_id)
-#     await update.message.reply_text(answer)
-
 async def handle_driver_message(update: Update, context: ContextTypes.DEFAULT_TYPE, driver_chat_id: int, text: str):
     driver = get_driver_by_chat(driver_chat_id)
     t = text.strip().lower()
@@ -441,18 +490,53 @@ async def handle_driver_message(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text("Responde únicamente con: ACEPTO o NO PUEDO.")
 
 
+# async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     chat_id = update.effective_chat.id
+#     text = (update.message.text or "").strip()
+
+#     if is_driver_chat(chat_id):
+#         await handle_driver_message(update, context, chat_id, text)
+#         return
+
+#     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+#     answer = await run_agent(text, chat_id)
+#     await update.message.reply_text(answer)
+
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Router:
+    - Si escribe un domiciliario -> handle_driver_message (ACEPTO / NO PUEDO)
+    - Si escribe un cliente -> run_agent + reply
+    """
     chat_id = update.effective_chat.id
     text = (update.message.text or "").strip()
 
+    # 1) Domiciliario
     if is_driver_chat(chat_id):
-        await handle_driver_message(update, context, chat_id, text)
+        try:
+            await handle_driver_message(update, context, chat_id, text)
+        except Exception:
+            logger.exception("Error en handle_driver_message driver_chat_id=%s", chat_id)
+            try:
+                await update.message.reply_text("Se presentó un error procesando tu respuesta. Reintenta.")
+            except Exception:
+                pass
         return
 
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-    answer = await run_agent(text, chat_id)
-    await update.message.reply_text(answer)
+    # 2) Cliente
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    except Exception:
+        # No es crítico
+        logger.exception("No pude enviar chat_action typing chat_id=%s", chat_id)
 
+    answer = await run_agent(text, chat_id)
+
+    # Responder al cliente (protegido contra transport closed)
+    try:
+        await update.message.reply_text(answer)
+    except Exception:
+        logger.exception("Fallo reply_text al usuario chat_id=%s", chat_id)
 
 
 @app.post("/telegram")
