@@ -22,7 +22,8 @@ from langgraph.checkpoint.memory import MemorySaver
 # -----------------------------
 # Aquí pegas los chat_id que te den por /id en Telegram
 DRIVERS = [
-    {"driver_id": "d1", "name": "Camila G", "chat_id": 7153322754, "is_available": True},
+    # {"driver_id": "d1", "name": "Camila G", "chat_id": 7153322754, "is_available": True},
+    {"driver_id": "d1", "name": "Camila V", "chat_id": 1076570639, "is_available": True},
 ]
 
 # dispatch_id -> info del despacho (RAM, se pierde si Cloud Run reinicia)
