@@ -32,6 +32,43 @@ ACTIVE_DISPATCHES: Dict[str, Dict[str, Any]] = {}
 # driver_chat_id -> dispatch_id activo
 DRIVER_ACTIVE: Dict[int, str] = {}
 
+MENU = {
+    "Pizzeria Orientini - Marinilla": {
+        "currency": "COP",
+        "delivery_fee": 6000,
+        "items": {
+            "pizza personal": {"price": 18000},
+            "pizza mediana": {"price": 35000},
+            "pizza familiar": {"price": 52000},
+            "gaseosa 1.5l": {"price": 8000},
+        },
+        "options": {
+            "pizza personal": {
+                "bordes": {"normal": 0, "queso": 4000},
+                "adiciones": {"extra queso": 3000, "pepperoni": 4000},
+            },
+            "pizza mediana": {
+                "bordes": {"normal": 0, "queso": 6000},
+                "adiciones": {"extra queso": 4000, "pepperoni": 6000},
+            },
+        },
+    },
+    "Hamburguesas El Parque": {
+        "currency": "COP",
+        "delivery_fee": 5000,
+        "items": {
+            "hamburguesa sencilla": {"price": 16000},
+            "hamburguesa doble": {"price": 24000},
+            "papas": {"price": 7000},
+            "gaseosa lata": {"price": 4500},
+        },
+        "options": {
+            "hamburguesa sencilla": {"adiciones": {"queso": 2000, "tocineta": 3000}},
+            "hamburguesa doble": {"adiciones": {"queso": 2000, "tocineta": 3000}},
+        },
+    },
+}
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tg-langgraph-agent")
@@ -71,48 +108,6 @@ def summarize_text(text: str, max_bullets: int = 5) -> str:
         return "No hay contenido para resumir."
     bullets = "\n".join([f"- {ln[:200]}" for ln in lines])
     return f"Resumen ({len(lines)} puntos):\n{bullets}"
-
-# @tool
-# def assign_driver(order_json) -> str:
-#     """
-#     Asigna un domiciliario disponible.
-#     Acepta order_json como: dict, JSON string, o texto. Retorna JSON ok/error.
-#     """
-#     try:
-#         # Normaliza entrada
-#         if isinstance(order_json, dict):
-#             order = order_json
-#         elif isinstance(order_json, str):
-#             s = order_json.strip()
-#             # intenta parsear como JSON si parece JSON
-#             if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
-#                 order = json.loads(s)
-#             else:
-#                 # no es JSON, pero no necesitamos el contenido para asignar
-#                 order = {"raw": s}
-#         else:
-#             order = {"raw_type": str(type(order_json))}
-#     except Exception as e:
-#         return json.dumps({"ok": False, "error": "No se pudo interpretar order_json", "detail": str(e)})
-
-#     try:
-#         available = [d for d in DRIVERS if d.get("is_available") is True]
-#         if not available:
-#             return json.dumps({"ok": False, "error": "No hay domiciliarios disponibles."})
-
-#         driver = available[0]
-#         driver["is_available"] = False
-#         dispatch_id = f"disp_{int(time.time())}"
-
-#         return json.dumps({
-#             "ok": True,
-#             "dispatch_id": dispatch_id,
-#             "driver_id": driver.get("driver_id"),
-#             "driver_name": driver.get("name"),
-#             "driver_chat_id": driver.get("chat_id"),
-#         })
-#     except Exception as e:
-#         return json.dumps({"ok": False, "error": "Error asignando domiciliario", "detail": str(e)})
 
 @tool
 def assign_driver(order_json, exclude_chat_ids=None) -> str:
@@ -172,64 +167,178 @@ def assign_driver(order_json, exclude_chat_ids=None) -> str:
         })
     except Exception as e:
         return json.dumps({"ok": False, "error": "Error asignando domiciliario", "detail": str(e)})
+    
+@tool
+def get_menu(restaurant: str) -> str:
+    """Devuelve el menú disponible para un restaurante (items, opciones, domicilio)."""
+    r = (restaurant or "").strip()
+    if r not in MENU:
+        # devuelve lista de restaurantes para guiar
+        return json.dumps({
+            "ok": False,
+            "error": "Restaurante no encontrado",
+            "available_restaurants": list(MENU.keys())
+        })
 
+    data = MENU[r]
+    return json.dumps({
+        "ok": True,
+        "restaurant": r,
+        "currency": data.get("currency", "COP"),
+        "delivery_fee": data.get("delivery_fee", 0),
+        "items": {k: v["price"] for k, v in data["items"].items()},
+        "options": data.get("options", {})
+    })
+
+
+@tool
+def price_order(order_json: str) -> str:
+    """
+    Calcula total de una orden con base en MENU.
+    Espera order_json con estructura:
+    {
+      "restaurante": "...",
+      "items":[
+        {"nombre":"pizza personal","cantidad":2,
+         "opciones":{"bordes":"queso","adiciones":["extra queso","pepperoni"]}}
+      ]
+    }
+    Retorna: ok, subtotal, domicilio, total, detalle_lineas, warnings
+    """
+    try:
+        order = json.loads(order_json) if isinstance(order_json, str) else order_json
+    except Exception as e:
+        return json.dumps({"ok": False, "error": "order_json inválido", "detail": str(e)})
+
+    restaurant = (order.get("restaurante") or "").strip()
+    if restaurant not in MENU:
+        return json.dumps({"ok": False, "error": "Restaurante no encontrado", "restaurant": restaurant})
+
+    cfg = MENU[restaurant]
+    items_cfg = cfg.get("items", {})
+    options_cfg = cfg.get("options", {})
+    delivery_fee = int(cfg.get("delivery_fee", 0))
+
+    warnings = []
+    detail = []
+    subtotal = 0
+
+    for it in order.get("items", []):
+        name = (it.get("nombre") or "").strip().lower()
+        qty = int(it.get("cantidad") or 1)
+        if qty < 1:
+            qty = 1
+
+        # buscar item por nombre (case-insensitive)
+        # (para performance, en prod pre-normalizas un dict)
+        found_key = None
+        for k in items_cfg.keys():
+            if k.lower() == name:
+                found_key = k
+                break
+
+        if not found_key:
+            warnings.append(f"Item no encontrado: {it.get('nombre')}")
+            continue
+
+        base_price = int(items_cfg[found_key]["price"])
+        line_extra = 0
+
+        chosen_opts = it.get("opciones") or {}
+
+        # bordes (string)
+        item_opts = options_cfg.get(found_key, {})
+        bordes_cfg = (item_opts.get("bordes") or {})
+        bordes_choice = chosen_opts.get("bordes")
+        if bordes_choice:
+            extra = bordes_cfg.get(str(bordes_choice).lower())
+            if extra is None:
+                # intenta match por keys originales
+                extra = bordes_cfg.get(str(bordes_choice))
+            if extra is None:
+                warnings.append(f"Opción bordes inválida en {found_key}: {bordes_choice}")
+            else:
+                line_extra += int(extra)
+
+        # adiciones (list)
+        add_cfg = (item_opts.get("adiciones") or {})
+        adds = chosen_opts.get("adiciones") or []
+        if isinstance(adds, str):
+            adds = [adds]
+
+        adds_ok = []
+        for a in adds:
+            a_str = str(a).strip().lower()
+            extra = None
+            for k in add_cfg.keys():
+                if k.lower() == a_str:
+                    extra = add_cfg[k]
+                    adds_ok.append(k)
+                    break
+            if extra is None:
+                warnings.append(f"Adición inválida en {found_key}: {a}")
+            else:
+                line_extra += int(extra)
+
+        unit = base_price + line_extra
+        line_total = unit * qty
+        subtotal += line_total
+
+        detail.append({
+            "item": found_key,
+            "cantidad": qty,
+            "base": base_price,
+            "extras": line_extra,
+            "unitario": unit,
+            "total_linea": line_total,
+            "opciones": {"bordes": bordes_choice, "adiciones": adds_ok}
+        })
+
+    total = subtotal + delivery_fee
+
+    return json.dumps({
+        "ok": True,
+        "restaurant": restaurant,
+        "currency": cfg.get("currency", "COP"),
+        "subtotal": subtotal,
+        "delivery_fee": delivery_fee,
+        "total": total,
+        "detalle_lineas": detail,
+        "warnings": warnings
+    })
 
 
 def _format_order_message(order: dict) -> str:
+    pricing = order.get("pricing", {})
+    total = pricing.get("total")
+    currency = pricing.get("currency", "COP")
+    medio_pago = order.get("medio_pago", "")
+
+    total_txt = f"{total:,} {currency}" if total is not None else "No especificado"
+
+    items_txt = ""
+    for it in order.get("items", []):
+        opts = it.get("opciones") or {}
+        extras = []
+        if opts.get("bordes"):
+            extras.append(f"Borde: {opts['bordes']}")
+        if opts.get("adiciones"):
+            extras.append("Adiciones: " + ", ".join(opts["adiciones"]))
+        extras_txt = f" ({'; '.join(extras)})" if extras else ""
+        items_txt += f"- {it['cantidad']} x {it['nombre']}{extras_txt}\n"
+
     return (
-        "📦 *Nuevo pedido*\n"
+        "📦 *Nuevo pedido*\n\n"
+        f"🏪 Restaurante: {order.get('restaurante','')}\n"
         f"👤 Cliente: {order.get('cliente','')}\n"
         f"📍 Dirección: {order.get('direccion','')}\n"
-        f"📞 Teléfono: {order.get('telefono','')}\n"
-        f"💳 Pago: {order.get('medio_pago','')}\n"
-        f"📝 Obs: {order.get('observaciones','')}\n\n"
-        "Responde: *ACEPTO* o *NO PUEDO*"
+        f"📞 Teléfono: {order.get('telefono','')}\n\n"
+        f"🧾 *Pedido:*\n{items_txt}\n"
+        f"💳 Medio de pago: *{medio_pago}*\n"
+        f"💰 *Total a cobrar:* *{total_txt}*\n\n"
+        "Responde: *ACEPTO*, *NO PUEDO* o *COMPLETADO*"
     )
 
-# @tool
-# def send_order_to_driver(driver_chat_id: int, customer_chat_id: int, dispatch_id: str, order_json: str) -> str:
-#     """Envía el pedido por Telegram al domiciliario y registra el despacho activo."""
-#     try:
-#         order = json.loads(order_json) if isinstance(order_json, str) else order_json
-#     except Exception:
-#         order = {"raw": str(order_json)}
-
-#     # Guarda el despacho con el customer_chat_id REAL (no adivinado)
-#     ACTIVE_DISPATCHES[dispatch_id] = {
-#         "dispatch_id": dispatch_id,
-#         "driver_chat_id": int(driver_chat_id),
-#         "customer_chat_id": int(customer_chat_id),
-#         "order": order,
-#         "status": "sent",
-#         "ts": int(time.time()),
-#     }
-#     DRIVER_ACTIVE[int(driver_chat_id)] = dispatch_id
-
-#     msg = _format_order_message(order)
-
-#     import asyncio
-
-#     async def _send():
-#         await tg_app.bot.send_message(
-#             chat_id=int(driver_chat_id),
-#             text=msg,
-#             parse_mode="Markdown"
-#         )
-
-#     try:
-#         try:
-#             loop = asyncio.get_event_loop()
-#             if loop.is_running():
-#                 asyncio.create_task(_send())
-#             else:
-#                 loop.run_until_complete(_send())
-#         except RuntimeError:
-#             asyncio.run(_send())
-#     except Exception as e:
-#         ACTIVE_DISPATCHES[dispatch_id]["status"] = "send_failed"
-#         return json.dumps({"ok": False, "error": f"Fallo enviando a driver: {str(e)}"})
-
-#     return json.dumps({"ok": True})
 
 @tool
 def send_order_to_driver(driver_chat_id: int, customer_chat_id: int, dispatch_id: str, order_json: str) -> str:
@@ -261,7 +370,7 @@ def send_order_to_driver(driver_chat_id: int, customer_chat_id: int, dispatch_id
     })
 
 
-TOOLS = [healthcheck, summarize_text, assign_driver, send_order_to_driver]
+TOOLS = [healthcheck, summarize_text, assign_driver, send_order_to_driver, get_menu, price_order]
 
 
 def build_agent():
@@ -271,10 +380,10 @@ def build_agent():
     )
 
     system_prompt = """
-          Eres “Domiflash”, agente virtual de atención para una empresa de domicilios, el cliente te va a mencionar un restaurante y un producto, no lo tienes que conocer.
+        Eres “Domiflash”, agente virtual de atención para una empresa de domicilios.
 
         OBJETIVO:
-        Tomar pedidos y coordinarlos con un domiciliario. Debes capturar y validar:
+        Ayuda al cliente a escoger su pedido, haz preguntas si es necesario. Debes tomar pedidos y coordinarlos con un domiciliario. Debes capturar y validar:
 
         1) cliente (nombre)
         2) direccion exacta
@@ -288,15 +397,27 @@ def build_agent():
         - Antes de despachar, muestra un resumen y pide confirmación: “¿Confirmas el pedido?”
         - Customer_chat_id es el valor exacto mostrado en el system message dinámico: customer_chat_id=...
 
+        MENÚ Y PRECIOS (OBLIGATORIO):
+        - Para mostrar opciones y precios, primero llama get_menu(restaurante).
+        - Para calcular el valor final, llama price_order(order_json).
 
-        FORMATO DEL PEDIDO (cuando tengas todo):
+        FORMATO DEL PEDIDO:
         {
+        "restaurante": "...",
         "cliente": "...",
         "direccion": "...",
         "telefono": "...",
         "medio_pago": "...",
-        "observaciones": "..."
+        "observaciones": "...",
+        "items": [
+            {"nombre": "...", "cantidad": 1, "opciones": {"bordes": "...", "adiciones": ["..."]}}
+        ]
         }
+
+        CIERRE ANTES DE CONFIRMAR (OBLIGATORIO):
+        - Cuando tengas los datos completos + items, llama price_order(order_json).
+        - Muestra: detalle por ítem, subtotal, domicilio, TOTAL.
+        - Pregunta: “¿Confirmas el pedido por <TOTAL>?”
 
         DESPACHO AUTOMÁTICO (OBLIGATORIO):
         Cuando el usuario confirme explícitamente el pedido, debes ejecutar EXACTAMENTE estos pasos:
@@ -528,48 +649,6 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await update.message.reply_text(f"Tu chat_id es: {chat_id}")
-
-# async def handle_driver_message(update: Update, context: ContextTypes.DEFAULT_TYPE, driver_chat_id: int, text: str):
-#     driver = get_driver_by_chat(driver_chat_id)
-#     t = text.strip().lower()
-
-#     dispatch_id = DRIVER_ACTIVE.get(int(driver_chat_id))
-#     if not dispatch_id or dispatch_id not in ACTIVE_DISPATCHES:
-#         await update.message.reply_text("No tengo un pedido activo. Si te llega uno, responde ACEPTO o NO PUEDO.")
-#         return
-
-#     dispatch = ACTIVE_DISPATCHES[dispatch_id]
-#     customer_chat_id = dispatch.get("customer_chat_id")
-
-#     if t in ["acepto", "aceptar", "ok", "listo", "si", "sí"]:
-#         dispatch["status"] = "accepted"
-#         try:
-#             await context.bot.send_message(
-#                 chat_id=int(customer_chat_id),
-#                 text=f"✅ Tu pedido fue aceptado por {driver.get('name','el domiciliario')} y va en camino. (ID: {dispatch_id})"
-#             )
-#         except Exception as e:
-#             logger.exception("No pude notificar al cliente chat_id=%r", customer_chat_id)
-#             await update.message.reply_text("✅ Aceptado, pero no pude notificar al cliente (chat_id inválido).")
-#             return
-
-#         await update.message.reply_text("✅ Pedido aceptado. Gracias.")
-#         return
-
-#     if t in ["no puedo", "rechazo", "no", "cancelar"]:
-#         dispatch["status"] = "rejected"
-#         if driver:
-#             driver["is_available"] = True
-
-#         await context.bot.send_message(
-#             chat_id=int(customer_chat_id),
-#             text=f"⚠️ El domiciliario no pudo tomar tu pedido (ID: {dispatch_id}). Estoy buscando otro disponible."
-#         )
-
-#         await update.message.reply_text("Entendido. Pedido liberado.")
-#         return
-
-#     await update.message.reply_text("Responde únicamente con: ACEPTO o NO PUEDO.")
 
 async def handle_driver_message(update: Update, context: ContextTypes.DEFAULT_TYPE, driver_chat_id: int, text: str):
     driver = get_driver_by_chat(driver_chat_id)
