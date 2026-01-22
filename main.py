@@ -72,11 +72,55 @@ def summarize_text(text: str, max_bullets: int = 5) -> str:
     bullets = "\n".join([f"- {ln[:200]}" for ln in lines])
     return f"Resumen ({len(lines)} puntos):\n{bullets}"
 
+# @tool
+# def assign_driver(order_json) -> str:
+#     """
+#     Asigna un domiciliario disponible.
+#     Acepta order_json como: dict, JSON string, o texto. Retorna JSON ok/error.
+#     """
+#     try:
+#         # Normaliza entrada
+#         if isinstance(order_json, dict):
+#             order = order_json
+#         elif isinstance(order_json, str):
+#             s = order_json.strip()
+#             # intenta parsear como JSON si parece JSON
+#             if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
+#                 order = json.loads(s)
+#             else:
+#                 # no es JSON, pero no necesitamos el contenido para asignar
+#                 order = {"raw": s}
+#         else:
+#             order = {"raw_type": str(type(order_json))}
+#     except Exception as e:
+#         return json.dumps({"ok": False, "error": "No se pudo interpretar order_json", "detail": str(e)})
+
+#     try:
+#         available = [d for d in DRIVERS if d.get("is_available") is True]
+#         if not available:
+#             return json.dumps({"ok": False, "error": "No hay domiciliarios disponibles."})
+
+#         driver = available[0]
+#         driver["is_available"] = False
+#         dispatch_id = f"disp_{int(time.time())}"
+
+#         return json.dumps({
+#             "ok": True,
+#             "dispatch_id": dispatch_id,
+#             "driver_id": driver.get("driver_id"),
+#             "driver_name": driver.get("name"),
+#             "driver_chat_id": driver.get("chat_id"),
+#         })
+#     except Exception as e:
+#         return json.dumps({"ok": False, "error": "Error asignando domiciliario", "detail": str(e)})
+
 @tool
-def assign_driver(order_json) -> str:
+def assign_driver(order_json, exclude_chat_ids=None) -> str:
     """
     Asigna un domiciliario disponible.
-    Acepta order_json como: dict, JSON string, o texto. Retorna JSON ok/error.
+    - order_json: dict | JSON string | texto
+    - exclude_chat_ids: lista opcional de chat_id a excluir (p.ej. el que rechazó)
+    Retorna JSON: ok, dispatch_id, driver_chat_id, driver_name...
     """
     try:
         # Normaliza entrada
@@ -84,11 +128,9 @@ def assign_driver(order_json) -> str:
             order = order_json
         elif isinstance(order_json, str):
             s = order_json.strip()
-            # intenta parsear como JSON si parece JSON
             if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
                 order = json.loads(s)
             else:
-                # no es JSON, pero no necesitamos el contenido para asignar
                 order = {"raw": s}
         else:
             order = {"raw_type": str(type(order_json))}
@@ -96,7 +138,24 @@ def assign_driver(order_json) -> str:
         return json.dumps({"ok": False, "error": "No se pudo interpretar order_json", "detail": str(e)})
 
     try:
-        available = [d for d in DRIVERS if d.get("is_available") is True]
+        # Normaliza exclude_chat_ids
+        if exclude_chat_ids is None:
+            exclude_set = set()
+        elif isinstance(exclude_chat_ids, (list, tuple, set)):
+            exclude_set = {int(x) for x in exclude_chat_ids if str(x).strip().isdigit() or isinstance(x, int)}
+        else:
+            # si llega como string JSON tipo "[123,456]"
+            try:
+                parsed = json.loads(str(exclude_chat_ids))
+                exclude_set = {int(x) for x in parsed}
+            except Exception:
+                exclude_set = set()
+
+        available = [
+            d for d in DRIVERS
+            if d.get("is_available") is True and int(d.get("chat_id")) not in exclude_set
+        ]
+
         if not available:
             return json.dumps({"ok": False, "error": "No hay domiciliarios disponibles."})
 
@@ -109,7 +168,7 @@ def assign_driver(order_json) -> str:
             "dispatch_id": dispatch_id,
             "driver_id": driver.get("driver_id"),
             "driver_name": driver.get("name"),
-            "driver_chat_id": driver.get("chat_id"),
+            "driver_chat_id": int(driver.get("chat_id")),
         })
     except Exception as e:
         return json.dumps({"ok": False, "error": "Error asignando domiciliario", "detail": str(e)})
@@ -392,9 +451,79 @@ async def run_agent(user_text: str, chat_id: int) -> str:
 
     return "No pude generar una respuesta. Intenta de nuevo."
 
+async def reassign_and_send(dispatch: dict, exclude_driver_chat_id: int) -> Dict[str, Any]:
+    """
+    Reasigna el pedido a otro driver disponible (excluyendo al que rechazó),
+    actualiza ACTIVE_DISPATCHES/DRIVER_ACTIVE y envía el mensaje al nuevo driver.
+    Retorna dict ok/error.
+    """
+    if tg_app is None:
+        return {"ok": False, "error": "Telegram app no inicializada"}
+
+    order = dispatch.get("order") or {}
+    customer_chat_id = dispatch.get("customer_chat_id")
+
+    # 1) Asignar nuevo driver excluyendo al que rechazó
+    try:
+        res = assign_driver(order, exclude_chat_ids=[exclude_driver_chat_id])
+        payload = json.loads(res) if isinstance(res, str) else res
+    except Exception as e:
+        logger.exception("Error en assign_driver reassign")
+        return {"ok": False, "error": "Error reasignando", "detail": str(e)}
+
+    if not payload.get("ok"):
+        return {"ok": False, "error": payload.get("error", "No disponible")}
+
+    new_driver_chat_id = int(payload["driver_chat_id"])
+    new_dispatch_id = payload["dispatch_id"]
+    new_driver_name = payload.get("driver_name", "")
+
+    # 2) Registrar nuevo dispatch (puedes conservar historial si quieres)
+    ACTIVE_DISPATCHES[new_dispatch_id] = {
+        "dispatch_id": new_dispatch_id,
+        "driver_chat_id": new_driver_chat_id,
+        "customer_chat_id": int(customer_chat_id) if customer_chat_id is not None else None,
+        "order": order,
+        "status": "sent",
+        "ts": int(time.time()),
+        "reassigned_from": dispatch.get("dispatch_id"),
+    }
+    DRIVER_ACTIVE[new_driver_chat_id] = new_dispatch_id
+
+    # 3) Enviar pedido al nuevo driver
+    msg = _format_order_message(order)
+    try:
+        await tg_app.bot.send_message(
+            chat_id=new_driver_chat_id,
+            text=msg,
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.exception("Fallo enviando a nuevo driver chat_id=%s", new_driver_chat_id)
+        # si falla, libéralo para no dejarlo ocupado
+        d = get_driver_by_chat(new_driver_chat_id)
+        if d:
+            d["is_available"] = True
+        DRIVER_ACTIVE.pop(new_driver_chat_id, None)
+        ACTIVE_DISPATCHES[new_dispatch_id]["status"] = "send_failed"
+        return {"ok": False, "error": "No pude enviar al nuevo domiciliario", "detail": str(e)}
+
+    # 4) Notificar al cliente (opcional pero recomendado)
+    try:
+        if customer_chat_id is not None:
+            await tg_app.bot.send_message(
+                chat_id=int(customer_chat_id),
+                text=f"🔄 El domiciliario anterior no pudo. Ya asigné a {new_driver_name or 'otro domiciliario'} para tu pedido. (ID: {new_dispatch_id})"
+            )
+    except Exception:
+        logger.exception("No pude notificar al cliente reasignación chat_id=%r", customer_chat_id)
+
+    return {"ok": True, "dispatch_id": new_dispatch_id, "driver_chat_id": new_driver_chat_id}
+
+
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Listo ✅ Escríbeme y te respondo.")
+    await update.message.reply_text("Envía un mensaje para iniciar la conversación.")
 
 async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -404,48 +533,43 @@ async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #     driver = get_driver_by_chat(driver_chat_id)
 #     t = text.strip().lower()
 
-#     dispatch_id = DRIVER_ACTIVE.get(driver_chat_id)
+#     dispatch_id = DRIVER_ACTIVE.get(int(driver_chat_id))
 #     if not dispatch_id or dispatch_id not in ACTIVE_DISPATCHES:
-#         await update.message.reply_text(
-#             "No tengo un pedido activo asignado. Si te llega uno, responde ACEPTO o NO PUEDO."
-#         )
+#         await update.message.reply_text("No tengo un pedido activo. Si te llega uno, responde ACEPTO o NO PUEDO.")
 #         return
 
 #     dispatch = ACTIVE_DISPATCHES[dispatch_id]
-#     customer_chat_id = dispatch["customer_chat_id"]
+#     customer_chat_id = dispatch.get("customer_chat_id")
 
-#     if t in ["acepto", "aceptar", "ok", "listo", "si"]:
+#     if t in ["acepto", "aceptar", "ok", "listo", "si", "sí"]:
 #         dispatch["status"] = "accepted"
+#         try:
+#             await context.bot.send_message(
+#                 chat_id=int(customer_chat_id),
+#                 text=f"✅ Tu pedido fue aceptado por {driver.get('name','el domiciliario')} y va en camino. (ID: {dispatch_id})"
+#             )
+#         except Exception as e:
+#             logger.exception("No pude notificar al cliente chat_id=%r", customer_chat_id)
+#             await update.message.reply_text("✅ Aceptado, pero no pude notificar al cliente (chat_id inválido).")
+#             return
 
-#         # Notificar al cliente
-#         await context.bot.send_message(
-#             chat_id=customer_chat_id,
-#             text=f"✅ Tu pedido fue aceptado por {driver.get('name','el domiciliario')} y ya va en camino. (ID: {dispatch_id})"
-#         )
-
-#         await update.message.reply_text("✅ Perfecto. Quedaste asignado a este pedido.")
-
+#         await update.message.reply_text("✅ Pedido aceptado. Gracias.")
 #         return
 
-#     if t in ["no puedo", "nopuedo", "rechazo", "cancelar", "no"]:
+#     if t in ["no puedo", "rechazo", "no", "cancelar"]:
 #         dispatch["status"] = "rejected"
-
-#         # Liberar domiciliario
 #         if driver:
 #             driver["is_available"] = True
 
 #         await context.bot.send_message(
-#             chat_id=customer_chat_id,
+#             chat_id=int(customer_chat_id),
 #             text=f"⚠️ El domiciliario no pudo tomar tu pedido (ID: {dispatch_id}). Estoy buscando otro disponible."
 #         )
 
-#         await update.message.reply_text("Entendido. Liberé el pedido.")
-
-#         # aquí podrías reintentar asignación automática con otro driver
+#         await update.message.reply_text("Entendido. Pedido liberado.")
 #         return
 
 #     await update.message.reply_text("Responde únicamente con: ACEPTO o NO PUEDO.")
-
 
 async def handle_driver_message(update: Update, context: ContextTypes.DEFAULT_TYPE, driver_chat_id: int, text: str):
     driver = get_driver_by_chat(driver_chat_id)
@@ -453,54 +577,100 @@ async def handle_driver_message(update: Update, context: ContextTypes.DEFAULT_TY
 
     dispatch_id = DRIVER_ACTIVE.get(int(driver_chat_id))
     if not dispatch_id or dispatch_id not in ACTIVE_DISPATCHES:
-        await update.message.reply_text("No tengo un pedido activo. Si te llega uno, responde ACEPTO o NO PUEDO.")
+        await update.message.reply_text(
+            "No tengo un pedido activo. Si te llega uno, responde ACEPTO, NO PUEDO o COMPLETADO."
+        )
         return
 
     dispatch = ACTIVE_DISPATCHES[dispatch_id]
     customer_chat_id = dispatch.get("customer_chat_id")
 
+    # ---------------------------
+    # 1) ACEPTAR
+    # ---------------------------
     if t in ["acepto", "aceptar", "ok", "listo", "si", "sí"]:
         dispatch["status"] = "accepted"
+        dispatch["accepted_ts"] = int(time.time())
+
         try:
             await context.bot.send_message(
                 chat_id=int(customer_chat_id),
                 text=f"✅ Tu pedido fue aceptado por {driver.get('name','el domiciliario')} y va en camino. (ID: {dispatch_id})"
             )
-        except Exception as e:
+        except Exception:
             logger.exception("No pude notificar al cliente chat_id=%r", customer_chat_id)
             await update.message.reply_text("✅ Aceptado, pero no pude notificar al cliente (chat_id inválido).")
             return
 
-        await update.message.reply_text("✅ Pedido aceptado. Gracias.")
+        await update.message.reply_text("✅ Pedido aceptado. Cuando entregues, responde COMPLETADO.")
         return
 
+    # ---------------------------
+    # 2) RECHAZAR
+    # ---------------------------
     if t in ["no puedo", "rechazo", "no", "cancelar"]:
+        # 1) marca el dispatch actual como rechazado
         dispatch["status"] = "rejected"
+        dispatch["rejected_ts"] = int(time.time())
+
+        # 2) libera al driver actual
         if driver:
             driver["is_available"] = True
 
-        await context.bot.send_message(
-            chat_id=int(customer_chat_id),
-            text=f"⚠️ El domiciliario no pudo tomar tu pedido (ID: {dispatch_id}). Estoy buscando otro disponible."
-        )
+        # 3) quita su asignación activa
+        DRIVER_ACTIVE.pop(int(driver_chat_id), None)
 
-        await update.message.reply_text("Entendido. Pedido liberado.")
+        # 4) intenta reasignar automáticamente
+        result = await reassign_and_send(dispatch, exclude_driver_chat_id=int(driver_chat_id))
+
+        if result.get("ok"):
+            await update.message.reply_text("Entendido. Reasigné el pedido a otro domiciliario.")
+        else:
+            # si no hay nadie disponible (o falló), avisa al cliente
+            try:
+                await context.bot.send_message(
+                    chat_id=int(customer_chat_id),
+                    text=f"⚠️ El domiciliario no pudo tomar tu pedido (ID: {dispatch_id}). En este momento no tengo otro disponible. ¿Deseas esperar o cancelar?"
+                )
+            except Exception:
+                logger.exception("No pude notificar al cliente sin disponibilidad chat_id=%r", customer_chat_id)
+
+            await update.message.reply_text("Entendido. No hay otro domiciliario disponible por ahora.")
         return
 
-    await update.message.reply_text("Responde únicamente con: ACEPTO o NO PUEDO.")
+    # ---------------------------
+    # 3) COMPLETAR (NUEVO)
+    # ---------------------------
+    if t in ["completado", "completo", "entregado", "finalizado", "terminado", "listo entregado"]:
+        # (Opcional) si quieres exigir que antes esté accepted:
+        # if dispatch.get("status") != "accepted":
+        #     await update.message.reply_text("Primero debes ACEPTO antes de marcar COMPLETADO.")
+        #     return
 
+        dispatch["status"] = "completed"
+        dispatch["completed_ts"] = int(time.time())
 
-# async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-#     chat_id = update.effective_chat.id
-#     text = (update.message.text or "").strip()
+        # Liberar driver
+        if driver:
+            driver["is_available"] = True
 
-#     if is_driver_chat(chat_id):
-#         await handle_driver_message(update, context, chat_id, text)
-#         return
+        # Quitar asignación activa
+        DRIVER_ACTIVE.pop(int(driver_chat_id), None)
 
-#     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-#     answer = await run_agent(text, chat_id)
-#     await update.message.reply_text(answer)
+        # (Opcional) notificar al cliente
+        try:
+            await context.bot.send_message(
+                chat_id=int(customer_chat_id),
+                text=f"✅ Pedido entregado. ¡Gracias! (ID: {dispatch_id})"
+            )
+        except Exception:
+            logger.exception("No pude notificar al cliente completado chat_id=%r", customer_chat_id)
+
+        await update.message.reply_text("✅ Pedido marcado como COMPLETADO. Ya quedaste disponible.")
+        return
+
+    await update.message.reply_text("Responde únicamente con: ACEPTO, NO PUEDO o COMPLETADO.")
+
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
