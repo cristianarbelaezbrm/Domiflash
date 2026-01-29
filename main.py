@@ -819,22 +819,22 @@ from fastapi import FastAPI, Request, HTTPException
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, ContextTypes, filters
 
-from app.config import settings
-from app.adapters.secrets import load_secret_as_env
-from app.adapters.telegram_client import TelegramClient
+from config import settings
+from adapters.secrets import load_secret_as_env
+from adapters.telegram_client import TelegramClient
 
-from app.domain.models import Driver
-from app.repositories.driver_repo import DriverRepository
-from app.repositories.dispatch_repo import DispatchRepository
-from app.repositories.menu_repo import MenuRepository
+from domain.models import Driver
+from repositories.driver_repo import DriverRepository
+from repositories.dispatch_repo import DispatchRepository
+from repositories.menu_repo import MenuRepository
 
-from app.services.pricing_service import PricingService
-from app.services.dispatch_service import DispatchService
+from services.pricing_service import PricingService
+from services.dispatch_service import DispatchService
 
-from app.llm.tools import build_tools
-from app.llm.agent_factory import build_agent
+from llm.tools import build_tools
+from llm.agent_factory import build_agent
 
-from app.application.telegram_router import TelegramRouter
+from application.telegram_router import TelegramRouter
 
 
 logging.basicConfig(level=logging.INFO)
